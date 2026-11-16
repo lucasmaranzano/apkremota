@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pantalla Remota</string>
+    <string name="acc_label">Pantalla Remota (control)</string>
+    <string name="acc_desc">Permite que Pantalla Remota toque, deslice y escriba en este celular cuando lo manejás desde el navegador de otro dispositivo. Solo actúa con órdenes enviadas desde una sesión con tu PIN.</string>
+</resources>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#111">
+<title>Pantalla Remota</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font-family: system-ui, -apple-system, Roboto, sans-serif; overflow: hidden; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center;
+    min-height: 0; position: relative; }
+  #screen { max-width: 100%; max-height: 100%; touch-action: none; user-select: none;
+    -webkit-user-select: none; -webkit-user-drag: none; display: none; background: #000; }
+  #msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 20px; color: #aaa; pointer-events: none; }
+  #toast { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+    background: rgba(0,0,0,.8); padding: 8px 14px; border-radius: 20px; font-size: 14px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; white-space: nowrap; }
+  #bar { display: flex; gap: 4px; padding: 6px; background: #1c1c1c; }
+  #bar button, #kb button { flex: 1; height: 46px; border: 0; border-radius: 10px; background: #2c2c2c;
+    color: #eee; font-size: 18px; }
+  #bar button:active, #kb button:active { background: #444; }
+  #kb { display: none; gap: 4px; padding: 6px; background: #1c1c1c; }
+  #kb input { flex: 3; height: 46px; border-radius: 10px; border: 1px solid #444; background: #222;
+    color: #fff; padding: 0 10px; font-size: 16px; min-width: 0; }
+  #kb button { flex: 0 0 52px; }
+  #login { position: fixed; inset: 0; background: #111; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; padding: 24px; }
+  #login input { font-size: 28px; text-align: center; letter-spacing: 6px; width: 220px; padding: 10px;
+    border-radius: 12px; border: 1px solid #444; background: #222; color: #fff; }
+  #login button { font-size: 18px; padding: 12px 40px; border-radius: 12px; border: 0;
+    background: #3a7bfd; color: #fff; }
+  #login .err { color: #ff7b6b; min-height: 20px; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #c33; align-self: center;
+    flex: 0 0 10px; margin: 0 4px; }
+  #dot.on { background: #2c2; }
+  #qsel { flex: 0 0 auto; height: 46px; border-radius: 10px; background: #2c2c2c; color: #eee; border: 0;
+    font-size: 14px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <img id="screen" alt="" draggable="false">
+    <div id="msg">Conectando…</div>
+    <div id="toast"></div>
+  </div>
+  <div id="kb">
+    <input id="kbin" type="text" placeholder="Escribí y tocá ➤" autocomplete="off" autocapitalize="off">
+    <button id="kbsend">➤</button>
+    <button id="kbbk">⌫</button>
+    <button id="kbenter">↵</button>
+  </div>
+  <div id="bar">
+    <span id="dot"></span>
+    <button data-k="back" title="Atrás">◀</button>
+    <button data-k="home" title="Inicio">●</button>
+    <button data-k="recents" title="Recientes">▢</button>
+    <button data-k="notif" title="Notificaciones">🔔</button>
+    <button id="kbtn" title="Teclado">⌨</button>
+    <button id="wake" title="Despertar pantalla">☀</button>
+    <button data-k="lock" title="Bloquear">🔒</button>
+    <select id="qsel" title="Calidad">
+      <option value="30,140">Baja</option>
+      <option value="55,80" selected>Media</option>
+      <option value="80,60">Alta</option>
+    </select>
+  </div>
+</div>
+
+<div id="login">
+  <h2 style="margin:0">Pantalla Remota</h2>
+  <div>Ingresá el PIN que muestra la app</div>
+  <input id="pin" type="tel" inputmode="numeric" maxlength="8" autocomplete="off">
+  <button id="go">Conectar</button>
+  <div class="err" id="err"></div>
+</div>
+
+<script>
+(function () {
+  const img = document.getElementById('screen');
+  const msg = document.getElementById('msg');
+  const toastEl = document.getElementById('toast');
+  const dot = document.getElementById('dot');
+  const login = document.getElementById('login');
+  const pinIn = document.getElementById('pin');
+  const err = document.getElementById('err');
+  let ws = null, pin = '', authed = false, lastUrl = null, retry = null, toastT = null;
+
+  function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+  function toast(t) {
+    toastEl.textContent = t; toastEl.style.opacity = 1;
+    clearTimeout(toastT); toastT = setTimeout(() => toastEl.style.opacity = 0, 1800);
+  }
+  function send(o) { if (ws && ws.readyState === 1 && authed) ws.send(JSON.stringify(o)); }
+
+  function connect() {
+    clearTimeout(retry);
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(proto + '://' + location.host + '/ws');
+    ws.binaryType = 'blob';
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'auth', pin: pin }));
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') {
+        const url = URL.createObjectURL(ev.data);
+        const old = lastUrl; lastUrl = url;
+        img.src = url;
+        if (old) setTimeout(() => URL.revokeObjectURL(old), 1000);
+        img.style.display = 'block'; msg.style.display = 'none';
+        return;
+      }
+      let o; try { o = JSON.parse(ev.data); } catch (e) { return; }
+      if (o.t === 'ok') {
+        authed = true; login.style.display = 'none'; dot.classList.add('on');
+        store('pr_pin', pin);
+        msg.textContent = 'Esperando imagen… (si la pantalla está apagada tocá ☀)';
+        applyQuality();
+      } else if (o.t === 'badpin') {
+        authed = false; err.textContent = 'PIN incorrecto'; login.style.display = 'flex';
+        ws.onclose = null; ws.close();
+      } else if (o.t === 'wait') {
+        err.textContent = 'Esperá un momento y probá de nuevo';
+        login.style.display = 'flex'; ws.onclose = null; ws.close();
+      } else if (o.t === 'noacc') {
+        toast('Activá "Control" (Accesibilidad) en la app');
+      } else if (o.t === 'nofield') {
+        toast('Tocá primero un campo de texto');
+      }
+    };
+    ws.onclose = () => {
+      dot.classList.remove('on');
+      if (authed) { msg.style.display = 'flex'; msg.textContent = 'Reconectando…'; retry = setTimeout(connect, 1500); }
+    };
+  }
+
+  function start() {
+    pin = pinIn.value.trim();
+    if (!pin) return;
+    err.textContent = '';
+    if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} }
+    authed = false;
+    connect();
+  }
+  document.getElementById('go').onclick = start;
+  pinIn.addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+  const saved = store('pr_pin');
+  if (saved) { pinIn.value = saved; start(); } else { pinIn.focus(); }
+
+  // ---------- Gestos sobre la imagen ----------
+  let down = null;
+  function pos(e) {
+    const r = img.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+      px: e.clientX, py: e.clientY
+    };
+  }
+  img.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (down) return; // ignorar segundo dedo
+    img.setPointerCapture(e.pointerId);
+    down = Object.assign(pos(e), { t: performance.now(), id: e.pointerId });
+  });
+  img.addEventListener('pointerup', e => {
+    if (!down || e.pointerId !== down.id) return;
+    const p = pos(e), dt = Math.round(performance.now() - down.t);
+    const moved = Math.hypot(p.px - down.px, p.py - down.py);
+    if (moved < 12) {
+      send({ t: 'tap', x: down.x, y: down.y, d: dt > 450 ? Math.min(dt, 2000) : 40 });
+    } else {
+      send({ t: 'swipe', x1: down.x, y1: down.y, x2: p.x, y2: p.y, d: Math.max(80, Math.min(dt, 2000)) });
+    }
+    down = null;
+  });
+  img.addEventListener('pointercancel', () => { down = null; });
+  img.addEventListener('contextmenu', e => e.preventDefault());
+
+  // ---------- Barra ----------
+  document.querySelectorAll('#bar button[data-k]').forEach(b =>
+    b.addEventListener('click', () => send({ t: 'key', k: b.dataset.k })));
+  document.getElementById('wake').onclick = () => { send({ t: 'wake' }); toast('Despertando pantalla'); };
+
+  const kb = document.getElementById('kb'), kbin = document.getElementById('kbin');
+  document.getElementById('kbtn').onclick = () => {
+    const show = kb.style.display !== 'flex';
+    kb.style.display = show ? 'flex' : 'none';
+    if (show) kbin.focus();
+  };
+  function sendText() { if (kbin.value) { send({ t: 'text', v: kbin.value }); kbin.value = ''; } }
+  document.getElementById('kbsend').onclick = sendText;
+  kbin.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); if (kbin.value) sendText(); else send({ t: 'enter' }); } });
+  document.getElementById('kbbk').onclick = () => send({ t: 'bksp' });
+  document.getElementById('kbenter').onclick = () => send({ t: 'enter' });
+
+  const qsel = document.getElementById('qsel');
+  const savedQ = store('pr_q'); if (savedQ) qsel.value = savedQ;
+  function applyQuality() {
+    const [q, ms] = qsel.value.split(',').map(Number);
+    send({ t: 'quality', v: q, ms: ms });
+  }
+  qsel.onchange = () => { store('pr_q', qsel.value); applyQuality(); };
+
+  // Mantener viva la conexión
+  setInterval(() => send({ t: 'ping' }), 20000);
+})();
+</script>
+</body>
+</html>
