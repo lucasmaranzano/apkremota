@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#111">
+<title>Pantalla Remota</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  #stage { flex: 1; position: relative; min-height: 0; }
+  #screen { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+    touch-action: none; user-select: none; -webkit-user-select: none; background: #000; outline: none; }
+  #msg { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px; align-items: center;
+    justify-content: center; text-align: center; padding: 20px; color: #bbb; pointer-events: none; }
+  #msg button { pointer-events: auto; font-size: 16px; padding: 10px 24px; border-radius: 10px; border: 0;
+    background: #3a7bfd; color: #fff; }
+  #toast { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+    background: rgba(0,0,0,.85); padding: 8px 14px; border-radius: 20px; font-size: 14px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; white-space: nowrap; }
+  #bar { display: flex; gap: 4px; padding: 6px; background: #1c1c1c; align-items: center; }
+  #bar button, #kb button { flex: 1; height: 44px; border: 0; border-radius: 10px; background: #2c2c2c;
+    color: #eee; font-size: 18px; cursor: pointer; min-width: 0; }
+  #bar button:hover, #kb button:hover { background: #383838; }
+  #bar button:active, #kb button:active { background: #4a4a4a; }
+  #kb { display: none; gap: 4px; padding: 6px; background: #1c1c1c; }
+  #kb input { flex: 3; height: 44px; border-radius: 10px; border: 1px solid #444; background: #222;
+    color: #fff; padding: 0 10px; font-size: 16px; min-width: 0; }
+  #kb button { flex: 0 0 52px; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #c33; flex: 0 0 10px; margin: 0 4px; }
+  #dot.on { background: #2c2; }
+  #qsel { flex: 0 0 auto; height: 44px; border-radius: 10px; background: #2c2c2c; color: #eee; border: 0;
+    font-size: 14px; padding: 0 4px; }
+  #login { position: fixed; inset: 0; background: #111; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; padding: 24px; z-index: 5; }
+  #login input { font-size: 24px; text-align: center; letter-spacing: 3px; width: 260px; padding: 10px;
+    border-radius: 12px; border: 1px solid #444; background: #222; color: #fff; }
+  #login button { font-size: 18px; padding: 12px 40px; border-radius: 12px; border: 0;
+    background: #3a7bfd; color: #fff; cursor: pointer; }
+  #login label { font-size: 14px; color: #aaa; margin-bottom: -6px; }
+  #login .err { color: #ff7b6b; min-height: 20px; text-align: center; }
+  .hint { font-size: 12px; color: #777; text-align: center; max-width: 420px; }
+  @media (pointer: coarse) { .desk { display: none; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <video id="screen" autoplay playsinline muted tabindex="0"></video>
+    <div id="msg"><div id="msgtxt">Conectando…</div><button id="retry" style="display:none">Reintentar</button></div>
+    <div id="toast"></div>
+  </div>
+  <div id="kb">
+    <input id="kbin" type="text" placeholder="Escribí y tocá ➤" autocomplete="off" autocapitalize="off">
+    <button id="kbsend" title="Enviar texto">➤</button>
+    <button id="kbbk" title="Borrar">⌫</button>
+    <button id="kbenter" title="Enter">↵</button>
+  </div>
+  <div id="bar">
+    <span id="dot"></span>
+    <button data-k="back" title="Atrás (Esc)">◀</button>
+    <button data-k="home" title="Inicio">●</button>
+    <button data-k="recents" title="Recientes">▢</button>
+    <button data-k="notif" title="Notificaciones">🔔</button>
+    <button id="kbtn" title="Teclado">⌨</button>
+    <button id="wake" title="Despertar pantalla">☀</button>
+    <button data-k="lock" title="Bloquear">🔒</button>
+    <button id="fs" class="desk" title="Pantalla completa">⛶</button>
+    <select id="qsel" title="Calidad">
+      <option value="400">Baja</option>
+      <option value="1500" selected>Media</option>
+      <option value="4000">Alta</option>
+    </select>
+  </div>
+</div>
+
+<div id="login">
+  <h2 style="margin:0">Pantalla Remota</h2>
+  <label for="code">Código del celular</label>
+  <input id="code" type="text" maxlength="12" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <label for="pin">PIN</label>
+  <input id="pin" type="tel" inputmode="numeric" maxlength="10" autocomplete="off">
+  <button id="go">Conectar</button>
+  <div class="err" id="err"></div>
+  <div class="hint">El código y el PIN los muestra la app Pantalla Remota en el celular.</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const SIGNAL = 'wss://0.peerjs.com:443/peerjs?key=peerjs';
+  const ICE = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443',
+             'turn:openrelay.metered.ca:443?transport=tcp'],
+      username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
+
+  const $ = id => document.getElementById(id);
+  const video = $('screen'), msg = $('msg'), msgtxt = $('msgtxt'), retryBtn = $('retry');
+  const toastEl = $('toast'), dot = $('dot'), login = $('login'), err = $('err');
+  const codeIn = $('code'), pinIn = $('pin');
+
+  function store(k, v) {
+    try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
+  }
+  function rnd(n) {
+    const a = 'abcdefghijkmnpqrstuvwxyz23456789', b = new Uint32Array(n);
+    crypto.getRandomValues(b); return Array.from(b, x => a[x % a.length]).join('');
+  }
+  let toastT = null;
+  function toast(t) {
+    toastEl.textContent = t; toastEl.style.opacity = 1;
+    clearTimeout(toastT); toastT = setTimeout(() => toastEl.style.opacity = 0, 2000);
+  }
+  function showMsg(t, retry) {
+    msg.style.display = 'flex'; msgtxt.textContent = t; retryBtn.style.display = retry ? 'inline-block' : 'none';
+  }
+
+  // ---------- Conexión ----------
+  let ws = null, pc = null, dc = null, sid = '', phoneId = '', pin = '', hb = null, timeout = null;
+  let remoteSet = false, pendingCand = [];
+
+  function cleanup() {
+    clearInterval(hb); clearTimeout(timeout);
+    if (dc) { try { dc.close(); } catch (e) {} dc = null; }
+    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+    if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} ws = null; }
+    dot.classList.remove('on');
+  }
+
+  function wsSend(type, payload) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type, dst: phoneId, payload }));
+  }
+
+  function connect() {
+    cleanup();
+    login.style.display = 'none';
+    showMsg('Conectando…');
+    sid = rnd(10); remoteSet = false; pendingCand = [];
+    ws = new WebSocket(SIGNAL + '&id=pantallaremota-v-' + rnd(10) + '&token=' + rnd(12) + '&version=1.5.4');
+    ws.onopen = () => { hb = setInterval(() => ws && ws.readyState === 1 && ws.send('{"type":"HEARTBEAT"}'), 5000); };
+    ws.onmessage = ev => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } onSignal(m); };
+    ws.onclose = () => { if (!pc || pc.connectionState !== 'connected') showMsg('Se perdió la conexión con el servidor.', true); };
+    timeout = setTimeout(() => {
+      if (!pc || pc.connectionState !== 'connected')
+        showMsg('No se pudo conectar. Revisá que la app esté compartiendo la pantalla en el celular.', true);
+    }, 25000);
+  }
+
+  async function startPeer() {
+    pc = new RTCPeerConnection({ iceServers: ICE });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    dc = pc.createDataChannel('ctl', { ordered: true });
+    dc.onopen = () => { dot.classList.add('on'); applyQuality(); };
+    dc.onclose = () => dot.classList.remove('on');
+    dc.onmessage = e => {
+      let o; try { o = JSON.parse(e.data); } catch (x) { return; }
+      if (o.t === 'noacc') toast('Activá "Control" (Accesibilidad) en la app del celular');
+      else if (o.t === 'nofield') toast('Tocá primero un campo de texto');
+    };
+    pc.ontrack = e => {
+      video.srcObject = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+      video.play().catch(() => {});
+    };
+    pc.onicecandidate = e => {
+      if (e.candidate) wsSend('CANDIDATE', { sid, candidate: e.candidate.candidate,
+        sdpMid: e.candidate.sdpMid || '0', sdpMLineIndex: e.candidate.sdpMLineIndex || 0 });
+    };
+    pc.onconnectionstatechange = () => {
+      const s = pc && pc.connectionState;
+      if (s === 'connected') {
+        clearTimeout(timeout); msg.style.display = 'none'; store('pr_code', phoneId.replace('pantallaremota-', ''));
+        store('pr_pin', pin); video.focus();
+      } else if (s === 'failed') {
+        showMsg('La conexión falló (la red puede estar bloqueando la conexión directa).', true);
+      } else if (s === 'disconnected') {
+        showMsg('Conexión inestable… reconectando');
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    wsSend('OFFER', { sid, pin, sdp: pc.localDescription.sdp });
+    showMsg('Esperando al celular…');
+  }
+
+  async function onSignal(m) {
+    const p = m.payload || {};
+    switch (m.type) {
+      case 'OPEN': startPeer().catch(e => showMsg('Error: ' + e.message, true)); break;
+      case 'ID-TAKEN': case 'ERROR': showMsg('Error del servidor de conexión. Reintentá.', true); break;
+      case 'EXPIRE': showMsg('El celular no está en línea. Abrí la app y tocá "Iniciar compartir pantalla".', true); break;
+      case 'ANSWER':
+        if (p.sid !== sid) return;
+        if (p.error === 'badpin') { cleanup(); login.style.display = 'flex'; err.textContent = 'PIN incorrecto'; return; }
+        if (p.error === 'wait') { cleanup(); login.style.display = 'flex'; err.textContent = 'Esperá unos segundos y probá de nuevo'; return; }
+        await pc.setRemoteDescription({ type: 'answer', sdp: p.sdp });
+        remoteSet = true;
+        for (const c of pendingCand) pc.addIceCandidate(c).catch(() => {});
+        pendingCand = [];
+        showMsg('Conectando video…');
+        break;
+      case 'CANDIDATE': {
+        if (p.sid !== sid || !pc) return;
+        const c = { candidate: p.candidate, sdpMid: p.sdpMid, sdpMLineIndex: p.sdpMLineIndex };
+        if (remoteSet) pc.addIceCandidate(c).catch(() => {}); else pendingCand.push(c);
+        break;
+      }
+    }
+  }
+
+  function start() {
+    const code = codeIn.value.trim().toLowerCase().replace(/^pantallaremota-/, '');
+    pin = pinIn.value.trim();
+    if (!code || !pin) { err.textContent = 'Completá código y PIN'; return; }
+    err.textContent = '';
+    phoneId = 'pantallaremota-' + code;
+    connect();
+  }
+  $('go').onclick = start;
+  pinIn.addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+  codeIn.addEventListener('keydown', e => { if (e.key === 'Enter') pinIn.focus(); });
+  retryBtn.onclick = () => connect();
+
+  const qs = new URLSearchParams(location.search);
+  codeIn.value = qs.get('c') || store('pr_code') || '';
+  const savedPin = store('pr_pin');
+  if (savedPin && codeIn.value && savedPin.length >= 4) { pinIn.value = savedPin; start(); }
+  else if (codeIn.value) pinIn.focus(); else codeIn.focus();
+
+  // ---------- Envío de órdenes ----------
+  function send(o) { if (dc && dc.readyState === 'open') dc.send(JSON.stringify(o)); }
+
+  // Rectángulo real del video dentro del elemento (object-fit: contain).
+  function norm(clientX, clientY) {
+    const r = video.getBoundingClientRect();
+    const vw = video.videoWidth || 9, vh = video.videoHeight || 16;
+    const s = Math.min(r.width / vw, r.height / vh);
+    const w = vw * s, h = vh * s, ox = r.left + (r.width - w) / 2, oy = r.top + (r.height - h) / 2;
+    return { x: Math.min(1, Math.max(0, (clientX - ox) / w)), y: Math.min(1, Math.max(0, (clientY - oy) / h)),
+             px: clientX, py: clientY };
+  }
+
+  let down = null;
+  video.addEventListener('pointerdown', e => {
+    e.preventDefault(); video.focus();
+    if (down || e.button > 0) return;
+    video.setPointerCapture(e.pointerId);
+    down = Object.assign(norm(e.clientX, e.clientY), { t: performance.now(), id: e.pointerId });
+  });
+  video.addEventListener('pointerup', e => {
+    if (!down || e.pointerId !== down.id) return;
+    const p = norm(e.clientX, e.clientY), dt = Math.round(performance.now() - down.t);
+    if (Math.hypot(p.px - down.px, p.py - down.py) < 10) {
+      send({ t: 'tap', x: down.x, y: down.y, d: dt > 450 ? Math.min(dt, 2000) : 40 });
+    } else {
+      send({ t: 'swipe', x1: down.x, y1: down.y, x2: p.x, y2: p.y, d: Math.max(80, Math.min(dt, 2000)) });
+    }
+    down = null;
+  });
+  video.addEventListener('pointercancel', () => { down = null; });
+  video.addEventListener('contextmenu', e => { e.preventDefault(); send({ t: 'key', k: 'back' }); });
+
+  // Rueda del mouse = deslizar (acumula para no saturar).
+  let wheelAcc = 0, wheelPos = null, wheelT = null;
+  video.addEventListener('wheel', e => {
+    e.preventDefault();
+    wheelAcc += e.deltaY; wheelPos = norm(e.clientX, e.clientY);
+    if (wheelT) return;
+    wheelT = setTimeout(() => {
+      const dy = Math.max(-0.45, Math.min(0.45, -wheelAcc / 1200));
+      const y1 = Math.min(0.9, Math.max(0.1, wheelPos.y));
+      const y2 = Math.min(0.98, Math.max(0.02, y1 + dy));
+      send({ t: 'swipe', x1: wheelPos.x, y1, x2: wheelPos.x, y2, d: 180 });
+      wheelAcc = 0; wheelT = null;
+    }, 120);
+  }, { passive: false });
+
+  // Teclado de la PC: escribe directo cuando el video tiene el foco.
+  let typeBuf = '', typeT = null;
+  function flushType() { if (typeBuf) { send({ t: 'text', v: typeBuf }); typeBuf = ''; } typeT = null; }
+  video.addEventListener('keydown', e => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'Escape') { send({ t: 'key', k: 'back' }); e.preventDefault(); return; }
+    if (e.key === 'Backspace') { flushType(); send({ t: 'bksp' }); e.preventDefault(); return; }
+    if (e.key === 'Enter') { flushType(); send({ t: 'enter' }); e.preventDefault(); return; }
+    if (e.key === 'Home') { send({ t: 'key', k: 'home' }); e.preventDefault(); return; }
+    if (e.key.length === 1) {
+      typeBuf += e.key; e.preventDefault();
+      if (!typeT) typeT = setTimeout(flushType, 150);
+    }
+  });
+
+  // ---------- Barra ----------
+  document.querySelectorAll('#bar button[data-k]').forEach(b =>
+    b.addEventListener('click', () => send({ t: 'key', k: b.dataset.k })));
+  $('wake').onclick = () => { send({ t: 'wake' }); toast('Despertando pantalla'); };
+  $('fs').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {});
+  };
+
+  const kb = $('kb'), kbin = $('kbin');
+  $('kbtn').onclick = () => {
+    const show = kb.style.display !== 'flex';
+    kb.style.display = show ? 'flex' : 'none';
+    if (show) kbin.focus(); else video.focus();
+  };
+  function sendText() { if (kbin.value) { send({ t: 'text', v: kbin.value }); kbin.value = ''; } }
+  $('kbsend').onclick = sendText;
+  kbin.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); if (kbin.value) sendText(); else send({ t: 'enter' }); }
+  });
+  $('kbbk').onclick = () => send({ t: 'bksp' });
+  $('kbenter').onclick = () => send({ t: 'enter' });
+
+  const qsel = $('qsel');
+  const savedQ = store('pr_q'); if (savedQ) qsel.value = savedQ;
+  function applyQuality() { send({ t: 'quality', kbps: Number(qsel.value) }); }
+  qsel.onchange = () => { store('pr_q', qsel.value); applyQuality(); video.focus(); };
+
+  setInterval(() => send({ t: 'ping' }), 20000);
+})();
+</script>
+</body>
+</html>
