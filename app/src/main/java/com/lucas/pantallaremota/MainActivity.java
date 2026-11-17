@@ -5,9 +5,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
-import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -29,38 +27,15 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.security.SecureRandom;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-
 public class MainActivity extends Activity {
 
     private static final int REQ_CAPTURE = 10;
-    private TextView status, accStatus, pinView;
+    private TextView accStatus, codeView, status;
     private Button startBtn;
     private final Handler ui = new Handler(Looper.getMainLooper());
-
-    // ------------------------------------------------------------------ PIN
-
-    static String getPin(Context ctx) {
-        SharedPreferences sp = ctx.getSharedPreferences("cfg", MODE_PRIVATE);
-        String pin = sp.getString("pin", null);
-        if (pin == null) {
-            pin = randomPin();
-            sp.edit().putString("pin", pin).apply();
-        }
-        return pin;
-    }
-
-    private static String randomPin() {
-        return String.format("%06d", new SecureRandom().nextInt(1_000_000));
-    }
-
-    // ------------------------------------------------------------------- UI
+    private final Runnable ticker = new Runnable() {
+        @Override public void run() { refresh(); ui.postDelayed(this, 1500); }
+    };
 
     @Override
     protected void onCreate(Bundle b) {
@@ -78,8 +53,8 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView help = new TextView(this);
-        help.setText("Manejá este celular desde Chrome en otro dispositivo.\n"
-                + "Paso 1: activá el control (una sola vez).\nPaso 2: iniciá el compartir pantalla.");
+        help.setText("Manejá este celular desde cualquier navegador (PC o celular), "
+                + "desde cualquier lugar, con el link y el PIN.");
         help.setPadding(0, dp(6), 0, dp(14));
         root.addView(help);
 
@@ -96,11 +71,28 @@ public class MainActivity extends Activity {
         startBtn.setOnClickListener(v -> toggle());
         root.addView(startBtn);
 
-        pinView = new TextView(this);
-        pinView.setTextSize(22);
-        pinView.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        pinView.setPadding(0, dp(16), 0, 0);
-        root.addView(pinView);
+        codeView = new TextView(this);
+        codeView.setTextSize(18);
+        codeView.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        codeView.setPadding(0, dp(18), 0, dp(4));
+        codeView.setTextIsSelectable(true);
+        root.addView(codeView);
+
+        Button copy = button("Copiar link");
+        copy.setOnClickListener(v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(ClipData.newPlainText("link", Config.link(this)));
+            Toast.makeText(this, "Link copiado", Toast.LENGTH_SHORT).show();
+        });
+        root.addView(copy);
+
+        Button share = button("Enviar link (WhatsApp, mail…)");
+        share.setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_SEND).setType("text/plain")
+                    .putExtra(Intent.EXTRA_TEXT, Config.link(this));
+            startActivity(Intent.createChooser(i, "Enviar link"));
+        });
+        root.addView(share);
 
         Button pinBtn = button("Cambiar PIN");
         pinBtn.setOnClickListener(v -> changePin());
@@ -109,18 +101,7 @@ public class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(16);
         status.setPadding(0, dp(16), 0, dp(8));
-        status.setTextIsSelectable(true);
         root.addView(status);
-
-        Button copy = button("Copiar dirección");
-        copy.setOnClickListener(v -> {
-            List<String> urls = urls();
-            if (urls.isEmpty()) return;
-            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-            cm.setPrimaryClip(ClipData.newPlainText("url", urls.get(0)));
-            Toast.makeText(this, "Copiada: " + urls.get(0), Toast.LENGTH_SHORT).show();
-        });
-        root.addView(copy);
 
         Button batt = button("Evitar que Android corte la app (batería)");
         batt.setOnClickListener(v -> askBattery());
@@ -152,7 +133,13 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        refresh();
+        ui.post(ticker);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        ui.removeCallbacks(ticker);
     }
 
     private void refresh() {
@@ -160,26 +147,23 @@ public class MainActivity extends Activity {
         accStatus.setText(acc ? "✔ Control activado" : "✖ Control desactivado (solo vas a poder ver, no tocar)");
         accStatus.setTextColor(acc ? Color.rgb(30, 140, 60) : Color.rgb(200, 60, 40));
 
-        pinView.setText("PIN: " + getPin(this));
+        codeView.setText("Link: " + Config.link(this) + "\nPIN: " + Config.pin(this));
 
-        boolean running = ScreenService.instance != null;
-        startBtn.setText(running ? "Detener compartir pantalla" : "2. Iniciar compartir pantalla");
-        if (running) {
-            StringBuilder sb = new StringBuilder("🟢 Activo. Abrí en Chrome del otro celular:\n\n");
-            List<String> urls = urls();
-            if (urls.isEmpty()) sb.append("(no hay red: conectate a Wi-Fi)\n");
-            for (String u : urls) sb.append(u).append('\n');
-            sb.append("\nLas direcciones 100.x.x.x son de Tailscale (sirven desde cualquier lugar).");
-            status.setText(sb.toString());
+        ScreenService s = ScreenService.instance;
+        startBtn.setText(s != null ? "Detener compartir pantalla" : "2. Iniciar compartir pantalla");
+        if (s != null) {
+            int n = s.viewerCount();
+            status.setText("🟢 Activo — servidor: " + ScreenService.signalState
+                    + "\nConectados ahora: " + n);
         } else {
-            status.setText("⚪ Detenido");
+            status.setText("⚪ Detenido" + ("Detenido".equals(ScreenService.signalState)
+                    ? "" : " — " + ScreenService.signalState));
         }
     }
 
     private void toggle() {
         if (ScreenService.instance != null) {
             startService(new Intent(this, ScreenService.class).setAction(ScreenService.ACTION_STOP));
-            ui.postDelayed(this::refresh, 500);
             return;
         }
         MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
@@ -194,29 +178,24 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Permiso de captura cancelado", Toast.LENGTH_SHORT).show();
             return;
         }
-        Intent svc = new Intent(this, ScreenService.class)
-                .putExtra("code", resultCode)
-                .putExtra("data", data);
-        startForegroundService(svc);
-        ui.postDelayed(this::refresh, 800);
+        startForegroundService(new Intent(this, ScreenService.class).putExtra("data", data));
     }
 
     private void changePin() {
         EditText et = new EditText(this);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
-        et.setHint("4 a 8 dígitos (vacío = aleatorio)");
+        et.setHint("6 a 10 dígitos");
         et.setGravity(Gravity.CENTER);
         new AlertDialog.Builder(this)
                 .setTitle("Nuevo PIN")
                 .setView(et)
                 .setPositiveButton("Guardar", (d, w) -> {
                     String p = et.getText().toString().trim();
-                    if (p.isEmpty()) p = randomPin();
-                    if (p.length() < 4 || p.length() > 8) {
-                        Toast.makeText(this, "Usá entre 4 y 8 dígitos", Toast.LENGTH_SHORT).show();
+                    if (p.length() < 6 || p.length() > 10) {
+                        Toast.makeText(this, "Usá entre 6 y 10 dígitos", Toast.LENGTH_SHORT).show();
                         return;
                     }
-                    getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("pin", p).apply();
+                    Config.setPin(this, p);
                     refresh();
                 })
                 .setNegativeButton("Cancelar", null)
@@ -235,25 +214,5 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
         }
-    }
-
-    /** Direcciones http://IP:puerto de todas las redes activas (Wi-Fi, Tailscale, etc.). */
-    private List<String> urls() {
-        List<String> wifi = new ArrayList<>(), other = new ArrayList<>();
-        try {
-            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                if (!ni.isUp() || ni.isLoopback()) continue;
-                String name = ni.getName();
-                // Datos móviles: esas IP no son alcanzables desde afuera, se omiten.
-                if (name.startsWith("rmnet") || name.startsWith("ccmni") || name.startsWith("dummy")) continue;
-                for (InetAddress a : Collections.list(ni.getInetAddresses())) {
-                    if (!(a instanceof Inet4Address)) continue;
-                    String url = "http://" + a.getHostAddress() + ":" + ScreenService.PORT;
-                    if (ni.getName().startsWith("wlan")) wifi.add(url); else other.add(url);
-                }
-            }
-        } catch (Exception ignored) { }
-        wifi.addAll(other);
-        return wifi;
     }
 }
