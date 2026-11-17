@@ -90,7 +90,7 @@
 <script>
 (function () {
   'use strict';
-  const SIGNAL = 'wss://0.peerjs.com:443/peerjs?key=peerjs';
+  const SIGNAL = 'wss://broker.hivemq.com:8884/mqtt';
   const ICE = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
@@ -120,46 +120,95 @@
     msg.style.display = 'flex'; msgtxt.textContent = t; retryBtn.style.display = retry ? 'inline-block' : 'none';
   }
 
+  // ---------- MQTT mínimo (solo para presentar navegador y celular) ----------
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  function mStr(s) { const b = enc.encode(s); return [b.length >> 8, b.length & 255, ...b]; }
+  function mPkt(h, body) {
+    const len = []; let n = body.length;
+    do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; len.push(d); } while (n > 0);
+    const out = new Uint8Array(1 + len.length + body.length);
+    out[0] = h; out.set(len, 1); out.set(body, 1 + len.length); return out;
+  }
+  function mqtt(onReady, onMsg, onClose) {
+    const w = new WebSocket(SIGNAL, 'mqtt'); w.binaryType = 'arraybuffer';
+    let buf = new Uint8Array(0), ping = null;
+    w.onopen = () => w.send(mPkt(0x10, [...mStr('MQTT'), 4, 2, 0, 60, ...mStr('prv-' + rnd(12))]));
+    w.onmessage = e => {
+      const inc = new Uint8Array(e.data), all = new Uint8Array(buf.length + inc.length);
+      all.set(buf); all.set(inc, buf.length);
+      let pos = 0;
+      for (;;) {
+        if (all.length - pos < 2) break;
+        let i = pos + 1, m = 1, len = 0, d, ok = true;
+        do { if (i >= all.length) { ok = false; break; } d = all[i++]; len += (d & 127) * m; m *= 128; } while (d & 128);
+        if (!ok || all.length - i < len) break;
+        const type = all[pos] >> 4;
+        if (type === 2) { ping = setInterval(() => w.readyState === 1 && w.send(new Uint8Array([0xC0, 0])), 30000); onReady(); }
+        else if (type === 3) {
+          const tl = (all[i] << 8) | all[i + 1], qos = (all[pos] >> 1) & 3;
+          const topic = dec.decode(all.slice(i + 2, i + 2 + tl));
+          onMsg(topic, dec.decode(all.slice(i + 2 + tl + (qos ? 2 : 0), i + len)));
+        }
+        pos = i + len;
+      }
+      buf = all.slice(pos);
+    };
+    w.onclose = () => { clearInterval(ping); onClose(); };
+    return {
+      sub: t => w.send(mPkt(0x82, [0, 1, ...mStr(t), 0])),
+      pub: (t, s) => { if (w.readyState === 1) w.send(mPkt(0x30, [...mStr(t), ...enc.encode(s)])); },
+      close: () => { w.onclose = null; clearInterval(ping); try { w.send(new Uint8Array([0xE0, 0])); w.close(); } catch (e) {} }
+    };
+  }
+
   // ---------- Conexión ----------
-  let ws = null, pc = null, dc = null, sid = '', phoneId = '', pin = '', hb = null, timeout = null;
-  let remoteSet = false, pendingCand = [];
+  let sig = null, pc = null, dc = null, sid = '', vid = '', base = '', pin = '', timeout = null;
+  let remoteSet = false, pendingCand = [], authed = false, offered = false;
 
   function cleanup() {
-    clearInterval(hb); clearTimeout(timeout);
+    clearTimeout(timeout);
+    if (sig) { sig.pub(base + '/in', JSON.stringify({ t: 'bye', from: vid, sid })); sig.close(); sig = null; }
     if (dc) { try { dc.close(); } catch (e) {} dc = null; }
     if (pc) { try { pc.close(); } catch (e) {} pc = null; }
-    if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} ws = null; }
-    dot.classList.remove('on');
+    dot.classList.remove('on'); authed = false;
   }
+  window.addEventListener('pagehide', cleanup);
 
-  function wsSend(type, payload) {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type, dst: phoneId, payload }));
-  }
+  function sendSig(o) { if (sig) sig.pub(base + '/in', JSON.stringify(Object.assign({ from: vid, sid }, o))); }
 
   function connect() {
     cleanup();
     login.style.display = 'none';
     showMsg('Conectando…');
-    sid = rnd(10); remoteSet = false; pendingCand = [];
-    ws = new WebSocket(SIGNAL + '&id=pantallaremota-v-' + rnd(10) + '&token=' + rnd(12) + '&version=1.5.4');
-    ws.onopen = () => { hb = setInterval(() => ws && ws.readyState === 1 && ws.send('{"type":"HEARTBEAT"}'), 5000); };
-    ws.onmessage = ev => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } onSignal(m); };
-    ws.onclose = () => { if (!pc || pc.connectionState !== 'connected') showMsg('Se perdió la conexión con el servidor.', true); };
-    timeout = setTimeout(() => {
-      if (!pc || pc.connectionState !== 'connected')
-        showMsg('No se pudo conectar. Revisá que la app esté compartiendo la pantalla en el celular.', true);
-    }, 25000);
+    sid = rnd(10); vid = rnd(12); remoteSet = false; pendingCand = []; offered = false;
+    sig = mqtt(() => {
+      sig.sub(base + '/out/' + vid);
+      sig.sub(base + '/status');
+      timeout = setTimeout(() => {
+        if (!offered) showMsg('El celular no está en línea. Abrí la app y tocá "Iniciar compartir pantalla".', true);
+        else if (!authed) showMsg('No se pudo conectar. Probá de nuevo o cambiá la calidad a Baja.', true);
+      }, offered ? 25000 : 6000);
+    }, onSignal, () => { if (!authed) showMsg('Se perdió la conexión con el servidor.', true); });
   }
 
   async function startPeer() {
+    offered = true;
+    clearTimeout(timeout);
+    timeout = setTimeout(() => { if (!authed) showMsg('No se pudo conectar. Revisá la conexión de los dos equipos y reintentá.', true); }, 30000);
     pc = new RTCPeerConnection({ iceServers: ICE });
     pc.addTransceiver('video', { direction: 'recvonly' });
     dc = pc.createDataChannel('ctl', { ordered: true });
-    dc.onopen = () => { dot.classList.add('on'); applyQuality(); };
+    dc.onopen = () => { dc.send(JSON.stringify({ t: 'auth', pin })); };
     dc.onclose = () => dot.classList.remove('on');
     dc.onmessage = e => {
       let o; try { o = JSON.parse(e.data); } catch (x) { return; }
-      if (o.t === 'noacc') toast('Activá "Control" (Accesibilidad) en la app del celular');
+      if (o.t === 'authok') {
+        authed = true; clearTimeout(timeout); dot.classList.add('on'); msg.style.display = 'none';
+        store('pr_code', base.split('/')[1]); store('pr_pin', pin); applyQuality(); video.focus();
+      } else if (o.t === 'badpin' || o.t === 'locked') {
+        store('pr_pin', ''); cleanup(); login.style.display = 'flex';
+        err.textContent = o.t === 'locked' ? 'Demasiados intentos. Esperá 10 minutos.' : 'PIN incorrecto';
+      } else if (o.t === 'noacc') toast('Activá "Control" (Accesibilidad) en la app del celular');
       else if (o.t === 'nofield') toast('Tocá primero un campo de texto');
     };
     pc.ontrack = e => {
@@ -167,57 +216,47 @@
       video.play().catch(() => {});
     };
     pc.onicecandidate = e => {
-      if (e.candidate) wsSend('CANDIDATE', { sid, candidate: e.candidate.candidate,
+      if (e.candidate) sendSig({ t: 'cand', candidate: e.candidate.candidate,
         sdpMid: e.candidate.sdpMid || '0', sdpMLineIndex: e.candidate.sdpMLineIndex || 0 });
     };
     pc.onconnectionstatechange = () => {
       const s = pc && pc.connectionState;
-      if (s === 'connected') {
-        clearTimeout(timeout); msg.style.display = 'none'; store('pr_code', phoneId.replace('pantallaremota-', ''));
-        store('pr_pin', pin); video.focus();
-      } else if (s === 'failed') {
-        showMsg('La conexión falló (la red puede estar bloqueando la conexión directa).', true);
-      } else if (s === 'disconnected') {
-        showMsg('Conexión inestable… reconectando');
-      }
+      if (s === 'failed') showMsg('La conexión falló (la red puede estar bloqueando la conexión directa).', true);
+      else if (s === 'disconnected') showMsg('Conexión inestable… esperando');
+      else if (s === 'connected' && authed) msg.style.display = 'none';
     };
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    wsSend('OFFER', { sid, pin, sdp: pc.localDescription.sdp });
+    sendSig({ t: 'offer', sdp: pc.localDescription.sdp });
     showMsg('Esperando al celular…');
   }
 
-  async function onSignal(m) {
-    const p = m.payload || {};
-    switch (m.type) {
-      case 'OPEN': startPeer().catch(e => showMsg('Error: ' + e.message, true)); break;
-      case 'ID-TAKEN': case 'ERROR': showMsg('Error del servidor de conexión. Reintentá.', true); break;
-      case 'EXPIRE': showMsg('El celular no está en línea. Abrí la app y tocá "Iniciar compartir pantalla".', true); break;
-      case 'ANSWER':
-        if (p.sid !== sid) return;
-        if (p.error === 'badpin') { cleanup(); login.style.display = 'flex'; err.textContent = 'PIN incorrecto'; return; }
-        if (p.error === 'wait') { cleanup(); login.style.display = 'flex'; err.textContent = 'Esperá unos segundos y probá de nuevo'; return; }
-        await pc.setRemoteDescription({ type: 'answer', sdp: p.sdp });
-        remoteSet = true;
-        for (const c of pendingCand) pc.addIceCandidate(c).catch(() => {});
-        pendingCand = [];
-        showMsg('Conectando video…');
-        break;
-      case 'CANDIDATE': {
-        if (p.sid !== sid || !pc) return;
-        const c = { candidate: p.candidate, sdpMid: p.sdpMid, sdpMLineIndex: p.sdpMLineIndex };
-        if (remoteSet) pc.addIceCandidate(c).catch(() => {}); else pendingCand.push(c);
-        break;
-      }
+  async function onSignal(topic, text) {
+    if (topic === base + '/status') {
+      if (text === 'online' && !offered) startPeer().catch(e => showMsg('Error: ' + e.message, true));
+      else if (text === 'offline' && !authed) showMsg('El celular no está en línea. Abrí la app y tocá "Iniciar compartir pantalla".', true);
+      return;
+    }
+    let p; try { p = JSON.parse(text); } catch (e) { return; }
+    if (p.sid !== sid || !pc) return;
+    if (p.t === 'answer') {
+      await pc.setRemoteDescription({ type: 'answer', sdp: p.sdp });
+      remoteSet = true;
+      for (const c of pendingCand) pc.addIceCandidate(c).catch(() => {});
+      pendingCand = [];
+      showMsg('Conectando video…');
+    } else if (p.t === 'cand') {
+      const c = { candidate: p.candidate, sdpMid: p.sdpMid, sdpMLineIndex: p.sdpMLineIndex };
+      if (remoteSet) pc.addIceCandidate(c).catch(() => {}); else pendingCand.push(c);
     }
   }
 
   function start() {
-    const code = codeIn.value.trim().toLowerCase().replace(/^pantallaremota-/, '');
+    const code = codeIn.value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
     pin = pinIn.value.trim();
     if (!code || !pin) { err.textContent = 'Completá código y PIN'; return; }
     err.textContent = '';
-    phoneId = 'pantallaremota-' + code;
+    base = 'pantallaremota/' + code;
     connect();
   }
   $('go').onclick = start;
