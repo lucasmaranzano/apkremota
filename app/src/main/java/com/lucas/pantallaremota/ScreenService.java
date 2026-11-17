@@ -74,7 +74,8 @@ public class ScreenService extends Service implements Signaling.Listener {
     private PowerManager.WakeLock cpuLock;
 
     private int capW, capH;
-    private volatile long lastBadPin;
+    private volatile int badPins;
+    private volatile long lockedUntil;
     private volatile int maxBitrate = 1_500_000;
 
     @Override
@@ -170,7 +171,12 @@ public class ScreenService extends Service implements Signaling.Listener {
         return dm;
     }
 
-    int viewerCount() { return sessions.size(); }
+    int viewerCount() { return authedCount(); }
+
+    /** Ejecuta en el hilo de WebRTC (ignora si el servicio ya se cerró). */
+    private void run(Runnable r) {
+        try { exec.execute(r); } catch (Exception ignored) { }
+    }
 
     // ------------------------------------------------------------ señalización
 
@@ -180,45 +186,56 @@ public class ScreenService extends Service implements Signaling.Listener {
     }
 
     @Override
-    public void onSignal(String type, String src, JSONObject payload) {
-        exec.execute(() -> {
+    public void onSignal(JSONObject m) {
+        run(() -> {
             try {
-                switch (type) {
-                    case "OFFER": handleOffer(src, payload); break;
-                    case "CANDIDATE": {
-                        Session s = sessions.get(payload.optString("sid"));
-                        if (s != null) s.addRemoteCandidate(payload);
+                String t = m.optString("t");
+                String from = m.optString("from");
+                String sid = m.optString("sid");
+                if (from.isEmpty() || sid.isEmpty()) return;
+                switch (t) {
+                    case "offer": handleOffer(from, sid, m.optString("sdp")); break;
+                    case "cand": {
+                        Session s = sessions.get(sid);
+                        if (s != null && s.peer.equals(from)) s.addRemoteCandidate(m);
                         break;
                     }
-                    case "LEAVE":
-                    case "EXPIRE":
-                        for (Session s : sessions.values()) if (s.peer.equals(src)) s.close();
+                    case "bye": {
+                        Session s = sessions.get(sid);
+                        if (s != null && s.peer.equals(from)) s.close();
                         break;
+                    }
                 }
             } catch (Throwable ignored) { }
         });
     }
 
-    private void handleOffer(String src, JSONObject p) throws Exception {
-        String sid = p.optString("sid");
-        if (sid.isEmpty() || track == null) return;
-        JSONObject reply = new JSONObject().put("sid", sid);
-
-        if (System.currentTimeMillis() - lastBadPin < 2000) {
-            signaling.send("ANSWER", src, reply.put("error", "wait"));
-            return;
-        }
-        if (!Config.pin(this).equals(p.optString("pin"))) {
-            lastBadPin = System.currentTimeMillis();
-            signaling.send("ANSWER", src, reply.put("error", "badpin"));
-            return;
-        }
-
+    private void handleOffer(String from, String sid, String sdp) {
+        if (track == null || sdp.isEmpty()) return;
+        // Límite de navegadores pendientes para que nadie sature el celular.
+        if (sessions.size() >= 6) return;
         Session old = sessions.remove(sid);
         if (old != null) old.close();
-        Session s = new Session(src, sid);
+        Session s = new Session(from, sid);
         sessions.put(sid, s);
-        s.start(p.optString("sdp"));
+        s.start(sdp);
+        // Si en 30 s no se identificó con el PIN, se corta.
+        main.postDelayed(() -> { if (!s.authed) run(s::close); }, 30000);
+    }
+
+    /** Verifica el PIN (llega por el canal cifrado). Bloquea 10 min tras 5 errores. */
+    private String checkPin(String pin) {
+        long now = System.currentTimeMillis();
+        if (now < lockedUntil) return "locked";
+        if (Config.pin(this).equals(pin)) { badPins = 0; return "ok"; }
+        if (++badPins >= 5) { badPins = 0; lockedUntil = now + 10 * 60_000; return "locked"; }
+        return "badpin";
+    }
+
+    int authedCount() {
+        int n = 0;
+        for (Session s : sessions.values()) if (s.authed) n++;
+        return n;
     }
 
     // ------------------------------------------------------------ órdenes
@@ -281,6 +298,7 @@ public class ScreenService extends Service implements Signaling.Listener {
     public void onDestroy() {
         instance = null;
         signalState = "Detenido";
+        main.removeCallbacksAndMessages(null);
         if (signaling != null) signaling.stop();
         for (Session s : sessions.values()) s.close();
         exec.shutdown();
@@ -312,6 +330,7 @@ public class ScreenService extends Service implements Signaling.Listener {
         RtpSender sender;
         DataChannel dc;
         boolean remoteSet, closed;
+        volatile boolean authed;
         final List<IceCandidate> pending = new ArrayList<>();
 
         Session(String peer, String sid) { this.peer = peer; this.sid = sid; }
@@ -322,8 +341,8 @@ public class ScreenService extends Service implements Signaling.Listener {
             pc = factory.createPeerConnection(cfg, this);
             if (pc == null) { sessions.remove(sid); return; }
             pc.setRemoteDescription(new SdpAdapter() {
-                @Override public void onSetSuccess() { exec.execute(Session.this::answer); }
-                @Override public void onSetFailure(String e) { exec.execute(Session.this::close); }
+                @Override public void onSetSuccess() { run(Session.this::answer); }
+                @Override public void onSetFailure(String e) { run(Session.this::close); }
             }, new SessionDescription(SessionDescription.Type.OFFER, offerSdp));
         }
 
@@ -333,19 +352,21 @@ public class ScreenService extends Service implements Signaling.Listener {
             for (IceCandidate c : pending) pc.addIceCandidate(c);
             pending.clear();
             sender = pc.addTrack(track, Collections.singletonList("pantalla"));
+            // No se envía imagen hasta que el navegador muestre el PIN correcto.
+            sender.setTrack(null, false);
             applyBitrate();
             pc.createAnswer(new SdpAdapter() {
                 @Override public void onCreateSuccess(SessionDescription d) {
                     pc.setLocalDescription(new SdpAdapter() {
                         @Override public void onSetSuccess() {
                             try {
-                                signaling.send("ANSWER", peer, new JSONObject()
+                                signaling.sendTo(peer, new JSONObject().put("t", "answer")
                                         .put("sid", sid).put("sdp", d.description));
                             } catch (Exception ignored) { }
                         }
                     }, d);
                 }
-                @Override public void onCreateFailure(String e) { exec.execute(Session.this::close); }
+                @Override public void onCreateFailure(String e) { run(Session.this::close); }
             }, new MediaConstraints());
         }
 
@@ -385,7 +406,7 @@ public class ScreenService extends Service implements Signaling.Listener {
         // PeerConnection.Observer
         @Override public void onIceCandidate(IceCandidate c) {
             try {
-                signaling.send("CANDIDATE", peer, new JSONObject().put("sid", sid)
+                signaling.sendTo(peer, new JSONObject().put("t", "cand").put("sid", sid)
                         .put("candidate", c.sdp).put("sdpMid", c.sdpMid)
                         .put("sdpMLineIndex", c.sdpMLineIndex));
             } catch (Exception ignored) { }
@@ -393,11 +414,11 @@ public class ScreenService extends Service implements Signaling.Listener {
         @Override public void onConnectionChange(PeerConnection.PeerConnectionState st) {
             if (st == PeerConnection.PeerConnectionState.FAILED
                     || st == PeerConnection.PeerConnectionState.CLOSED) {
-                exec.execute(this::close);
+                run(this::close);
             } else if (st == PeerConnection.PeerConnectionState.DISCONNECTED) {
                 main.postDelayed(() -> {
                     if (pc != null && !closed && pc.connectionState()
-                            == PeerConnection.PeerConnectionState.DISCONNECTED) exec.execute(this::close);
+                            == PeerConnection.PeerConnectionState.DISCONNECTED) run(this::close);
                 }, 15000);
             }
         }
@@ -423,9 +444,23 @@ public class ScreenService extends Service implements Signaling.Listener {
             byte[] b = new byte[data.remaining()];
             data.get(b);
             String txt = new String(b, StandardCharsets.UTF_8);
-            exec.execute(() -> {
+            run(() -> {
                 try {
-                    String reply = handleCommand(new JSONObject(txt));
+                    JSONObject o = new JSONObject(txt);
+                    if (!authed) {
+                        if (!"auth".equals(o.optString("t"))) return;
+                        String r = checkPin(o.optString("pin"));
+                        if ("ok".equals(r)) {
+                            authed = true;
+                            sender.setTrack(track, false);
+                            sendText("{\"t\":\"authok\"}");
+                        } else {
+                            sendText("{\"t\":\"" + r + "\"}");
+                            main.postDelayed(() -> run(this::close), 1000);
+                        }
+                        return;
+                    }
+                    String reply = handleCommand(o);
                     if (reply != null) sendText(reply);
                 } catch (Throwable ignored) { }
             });
