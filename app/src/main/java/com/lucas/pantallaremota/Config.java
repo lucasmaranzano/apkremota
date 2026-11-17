@@ -15,8 +15,8 @@ final class Config {
     /** Página web desde donde se maneja el celular (se le agrega ?c=CODIGO). */
     static final String VIEWER_URL = "https://lucasmaranzano.github.io/apkremota/";
 
-    /** Servidor público y gratuito de PeerJS: solo sirve para "presentar" a los dos equipos. */
-    static final String SIGNAL_URL = "wss://0.peerjs.com:443/peerjs?key=peerjs";
+    /** Servidor MQTT público y gratuito: solo sirve para "presentar" a los dos equipos. */
+    static final String SIGNAL_URL = "wss://broker.hivemq.com:8884/mqtt";
 
     private static final String ALNUM = "abcdefghijkmnpqrstuvwxyz23456789";
 
@@ -47,22 +47,12 @@ final class Config {
         return sb.toString();
     }
 
-    /** Código fijo de este celular (también es su ID en el servidor de señalización). */
+    /** Código fijo de este celular (identifica su canal en el servidor de señalización). */
     static String code(Context c) {
         String v = sp(c).getString("code", null);
         if (v == null) { v = random(8); sp(c).edit().putString("code", v).apply(); }
         return v;
     }
-
-    static String peerId(Context c) { return "pantallaremota-" + code(c); }
-
-    static String token(Context c) {
-        String v = sp(c).getString("token", null);
-        if (v == null) { v = random(16); sp(c).edit().putString("token", v).apply(); }
-        return v;
-    }
-
-    static void newToken(Context c) { sp(c).edit().putString("token", random(16)).apply(); }
 
     static String pin(Context c) {
         String v = sp(c).getString("pin", null);
