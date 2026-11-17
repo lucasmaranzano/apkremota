@@ -5,67 +5,77 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.content.res.Configuration;
-import android.graphics.Bitmap;
-import android.graphics.PixelFormat;
-import android.hardware.display.DisplayManager;
-import android.hardware.display.VirtualDisplay;
-import android.media.Image;
-import android.media.ImageReader;
 import android.media.projection.MediaProjection;
-import android.media.projection.MediaProjectionManager;
-import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
-import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
 
 import org.json.JSONObject;
+import org.webrtc.DataChannel;
+import org.webrtc.DefaultVideoDecoderFactory;
+import org.webrtc.DefaultVideoEncoderFactory;
+import org.webrtc.EglBase;
+import org.webrtc.IceCandidate;
+import org.webrtc.MediaConstraints;
+import org.webrtc.MediaStream;
+import org.webrtc.PeerConnection;
+import org.webrtc.PeerConnectionFactory;
+import org.webrtc.RtpParameters;
+import org.webrtc.RtpReceiver;
+import org.webrtc.RtpSender;
+import org.webrtc.ScreenCapturerAndroid;
+import org.webrtc.SdpObserver;
+import org.webrtc.SessionDescription;
+import org.webrtc.SurfaceTextureHelper;
+import org.webrtc.VideoSource;
+import org.webrtc.VideoTrack;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
-/** Captura la pantalla, la sirve por WebSocket y recibe las órdenes de control. */
-public class ScreenService extends Service {
+/**
+ * Captura la pantalla y la transmite por WebRTC a los navegadores que se conectan
+ * con el código y el PIN. Recibe las órdenes (toques, teclas) por un canal de datos.
+ */
+public class ScreenService extends Service implements Signaling.Listener {
 
     static final String ACTION_STOP = "com.lucas.pantallaremota.STOP";
-    static final int PORT = 8080;
     private static final String CHANNEL = "pantalla_remota";
-    private static final int MAX_SIDE = 1080;   // lado mayor de la imagen enviada
+    private static final int MAX_SIDE = 1280;
+    private static final int FPS = 20;
 
     static volatile ScreenService instance;
+    static volatile String signalState = "Detenido";
 
-    private MediaProjection projection;
-    private VirtualDisplay virtualDisplay;
-    private ImageReader reader;
-    private HandlerThread thread;
-    private Handler handler;
-    private ScheduledExecutorService encoder;
-    private RemoteServer server;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final ExecutorService exec = Executors.newSingleThreadExecutor();
+    private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+
+    private EglBase egl;
+    private PeerConnectionFactory factory;
+    private ScreenCapturerAndroid capturer;
+    private SurfaceTextureHelper textureHelper;
+    private VideoSource source;
+    private VideoTrack track;
+    private Signaling signaling;
     private PowerManager.WakeLock cpuLock;
-    private WifiManager.WifiLock wifiLock;
 
-    // Tamaño real de la pantalla (para mapear los toques) y de la captura.
-    volatile int realW, realH;
     private int capW, capH;
-
-    // Último cuadro capturado (se reutiliza para no crear objetos en cada frame).
-    private final Object frameLock = new Object();
-    private Bitmap latest;
-    private boolean dirty;
-    private volatile byte[] lastJpeg;
-    volatile int jpegQuality = 55;
-    volatile int frameIntervalMs = 80;   // ~12 fps
-    private long lastEncode;
+    private volatile long lastBadPin;
+    private volatile int maxBitrate = 1_500_000;
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -77,39 +87,57 @@ public class ScreenService extends Service {
             return START_NOT_STICKY;
         }
         startAsForeground();
-        if (intent == null || projection != null) return START_NOT_STICKY;
+        if (intent == null || factory != null) return START_NOT_STICKY;
 
-        int code = intent.getIntExtra("code", 0);
         Intent data = Build.VERSION.SDK_INT >= 33
                 ? intent.getParcelableExtra("data", Intent.class)
                 : intent.getParcelableExtra("data");
         if (data == null) { stopSelf(); return START_NOT_STICKY; }
 
-        thread = new HandlerThread("captura");
-        thread.start();
-        handler = new Handler(thread.getLooper());
-
-        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        projection = mpm.getMediaProjection(code, data);
-        if (projection == null) { stopSelf(); return START_NOT_STICKY; }
-        projection.registerCallback(new MediaProjection.Callback() {
-            @Override public void onStop() { stopSelf(); }
-        }, handler);
-
-        acquireLocks();
-        setupDisplay();
-
-        encoder = Executors.newSingleThreadScheduledExecutor();
-        encoder.scheduleWithFixedDelay(this::encodeTick, 100, 20, TimeUnit.MILLISECONDS);
-
         try {
-            server = new RemoteServer(PORT, this);
-            server.start(0, false);  // sin timeout de lectura: el WebSocket queda abierto
-        } catch (Exception e) {
-            server = null;
+            startCapture(data);
+        } catch (Throwable t) {
+            signalState = "Error al iniciar: " + t.getMessage();
+            stopSelf();
+            return START_NOT_STICKY;
         }
+
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pantallaremota:cpu");
+        cpuLock.acquire();
+
+        signaling = new Signaling(this, this);
+        signaling.connect();
         instance = this;
         return START_NOT_STICKY;
+    }
+
+    private void startCapture(Intent data) {
+        PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions
+                .builder(getApplicationContext()).createInitializationOptions());
+        egl = EglBase.create();
+        factory = PeerConnectionFactory.builder()
+                .setVideoEncoderFactory(new DefaultVideoEncoderFactory(egl.getEglBaseContext(), true, true))
+                .setVideoDecoderFactory(new DefaultVideoDecoderFactory(egl.getEglBaseContext()))
+                .createPeerConnectionFactory();
+
+        capturer = new ScreenCapturerAndroid(data, new MediaProjection.Callback() {
+            @Override public void onStop() { main.post(() -> stopSelf()); }
+        });
+        textureHelper = SurfaceTextureHelper.create("captura", egl.getEglBaseContext());
+        source = factory.createVideoSource(true);
+        capturer.initialize(textureHelper, getApplicationContext(), source.getCapturerObserver());
+
+        // Tamaño fijo según la orientación natural; si el celular gira, Android
+        // encuadra la imagen dentro de este marco (ver mapX/mapY).
+        DisplayMetrics dm = realMetrics();
+        int w = Math.min(dm.widthPixels, dm.heightPixels);
+        int h = Math.max(dm.widthPixels, dm.heightPixels);
+        float scale = Math.min(1f, MAX_SIDE / (float) h);
+        capW = Math.max(16, Math.round(w * scale / 16f) * 16);
+        capH = Math.max(16, Math.round(h * scale / 16f) * 16);
+        capturer.startCapture(capW, capH, FPS);
+        track = factory.createVideoTrack("pantalla", source);
     }
 
     private void startAsForeground() {
@@ -123,7 +151,7 @@ public class ScreenService extends Service {
         Notification n = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setContentTitle("Pantalla Remota activa")
-                .setContentText("Compartiendo pantalla en el puerto " + PORT)
+                .setContentText("Tu pantalla se puede ver con tu código y PIN")
                 .setContentIntent(openPi)
                 .addAction(new Notification.Action.Builder(null, "Detener", stopPi).build())
                 .setOngoing(true)
@@ -136,172 +164,102 @@ public class ScreenService extends Service {
     }
 
     @SuppressWarnings("deprecation")
-    private void acquireLocks() {
-        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-        cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pantallaremota:cpu");
-        cpuLock.acquire();
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm != null) {
-            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "pantallaremota:wifi");
-            wifiLock.acquire();
-        }
-    }
-
-    @SuppressWarnings("deprecation")
     private DisplayMetrics realMetrics() {
         DisplayMetrics dm = new DisplayMetrics();
-        WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        wm.getDefaultDisplay().getRealMetrics(dm);
+        ((WindowManager) getSystemService(WINDOW_SERVICE)).getDefaultDisplay().getRealMetrics(dm);
         return dm;
     }
 
-    /** Crea (o adapta tras una rotación) la pantalla virtual que espeja la real. */
-    private void setupDisplay() {
-        DisplayMetrics dm = realMetrics();
-        realW = dm.widthPixels;
-        realH = dm.heightPixels;
-        float scale = Math.min(1f, MAX_SIDE / (float) Math.max(realW, realH));
-        capW = Math.max(2, Math.round(realW * scale) & ~1);
-        capH = Math.max(2, Math.round(realH * scale) & ~1);
+    int viewerCount() { return sessions.size(); }
 
-        ImageReader old = reader;
-        reader = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
-        reader.setOnImageAvailableListener(this::onImage, handler);
+    // ------------------------------------------------------------ señalización
 
-        if (virtualDisplay == null) {
-            virtualDisplay = projection.createVirtualDisplay("pantalla-remota", capW, capH,
-                    dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    reader.getSurface(), null, handler);
-        } else {
-            virtualDisplay.resize(capW, capH, dm.densityDpi);
-            virtualDisplay.setSurface(reader.getSurface());
-        }
-        if (old != null) old.close();
-        if (server != null) server.broadcastText(sizeMessage());
-    }
-
-    String sizeMessage() {
-        return "{\"t\":\"size\",\"w\":" + capW + ",\"h\":" + capH + "}";
+    @Override
+    public void onSignalState(String state) {
+        signalState = state;
     }
 
     @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        if (handler == null) return;
-        handler.postDelayed(() -> {
-            if (projection == null) return;
-            DisplayMetrics dm = realMetrics();
-            if (dm.widthPixels != realW || dm.heightPixels != realH) setupDisplay();
-        }, 300);
-    }
-
-    /** Copia cada cuadro nuevo al bitmap "latest" (en el hilo de captura). */
-    private void onImage(ImageReader r) {
-        Image img;
-        try { img = r.acquireLatestImage(); } catch (Exception e) { return; }
-        if (img == null) return;
-        try {
-            if (r != reader) return; // cuadro de un reader viejo (rotación)
-            Image.Plane plane = img.getPlanes()[0];
-            ByteBuffer buf = plane.getBuffer();
-            int pixelStride = plane.getPixelStride();
-            int stridePx = plane.getRowStride() / pixelStride;
-            int w = img.getWidth(), h = img.getHeight();
-            synchronized (frameLock) {
-                if (latest == null || latest.getWidth() != stridePx || latest.getHeight() != h) {
-                    if (latest != null) latest.recycle();
-                    latest = Bitmap.createBitmap(stridePx, h, Bitmap.Config.ARGB_8888);
+    public void onSignal(String type, String src, JSONObject payload) {
+        exec.execute(() -> {
+            try {
+                switch (type) {
+                    case "OFFER": handleOffer(src, payload); break;
+                    case "CANDIDATE": {
+                        Session s = sessions.get(payload.optString("sid"));
+                        if (s != null) s.addRemoteCandidate(payload);
+                        break;
+                    }
+                    case "LEAVE":
+                    case "EXPIRE":
+                        for (Session s : sessions.values()) if (s.peer.equals(src)) s.close();
+                        break;
                 }
-                buf.rewind();
-                latest.copyPixelsFromBuffer(buf);
-                latestW = w;
-                dirty = true;
-            }
-        } catch (Exception ignored) {
-        } finally {
-            img.close();
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    private void handleOffer(String src, JSONObject p) throws Exception {
+        String sid = p.optString("sid");
+        if (sid.isEmpty() || track == null) return;
+        JSONObject reply = new JSONObject().put("sid", sid);
+
+        if (System.currentTimeMillis() - lastBadPin < 2000) {
+            signaling.send("ANSWER", src, reply.put("error", "wait"));
+            return;
         }
+        if (!Config.pin(this).equals(p.optString("pin"))) {
+            lastBadPin = System.currentTimeMillis();
+            signaling.send("ANSWER", src, reply.put("error", "badpin"));
+            return;
+        }
+
+        Session old = sessions.remove(sid);
+        if (old != null) old.close();
+        Session s = new Session(src, sid);
+        sessions.put(sid, s);
+        s.start(p.optString("sdp"));
     }
 
-    private int latestW;
+    // ------------------------------------------------------------ órdenes
 
-    /** Comprime el último cuadro a JPEG y lo envía a los clientes conectados. */
-    private void encodeTick() {
-        try {
-            if (server == null || !server.hasClients()) return;
-            long now = System.currentTimeMillis();
-            if (now - lastEncode < frameIntervalMs) return;
-            byte[] jpg;
-            synchronized (frameLock) {
-                if (!dirty || latest == null) return;
-                dirty = false;
-                Bitmap src = latest;
-                Bitmap crop = latestW < src.getWidth()
-                        ? Bitmap.createBitmap(src, 0, 0, latestW, src.getHeight())
-                        : src;
-                ByteArrayOutputStream out = new ByteArrayOutputStream(128 * 1024);
-                crop.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out);
-                if (crop != src) crop.recycle();
-                jpg = out.toByteArray();
-            }
-            lastEncode = now;
-            lastJpeg = jpg;
-            server.broadcast(jpg);
-        } catch (Throwable ignored) { }
+    /** Convierte una coordenada 0..1 del video a píxeles reales de la pantalla. */
+    private float[] map(double fx, double fy) {
+        DisplayMetrics dm = realMetrics();
+        float rw = dm.widthPixels, rh = dm.heightPixels;
+        float s = Math.min(capW / rw, capH / rh);
+        float offX = (capW - rw * s) / 2f, offY = (capH - rh * s) / 2f;
+        float x = (float) ((fx * capW - offX) / s);
+        float y = (float) ((fy * capH - offY) / s);
+        return new float[]{Math.max(0, Math.min(rw - 1, x)), Math.max(0, Math.min(rh - 1, y))};
     }
 
-    byte[] lastFrame() { return lastJpeg; }
-
-    /** Pide un cuadro nuevo aunque la pantalla no haya cambiado (al conectarse alguien). */
-    void requestFrame() {
-        synchronized (frameLock) { if (latest != null) dirty = true; }
-    }
-
-    // ---------------------------------------------------------------- órdenes
-
-    /** Ejecuta una orden recibida del navegador. Devuelve un mensaje para el cliente o null. */
-    String handleCommand(JSONObject o) {
+    private String handleCommand(JSONObject o) {
         String t = o.optString("t");
         switch (t) {
-            case "wake":
-                wakeScreen();
-                return null;
-            case "quality":
-                jpegQuality = clamp(o.optInt("v", 55), 15, 90);
-                frameIntervalMs = clamp(o.optInt("ms", 80), 40, 500);
-                requestFrame();
-                return null;
-            case "ping":
-                return "{\"t\":\"pong\"}";
+            case "wake": wakeScreen(); return null;
+            case "quality": setBitrate(o.optInt("kbps", 1500) * 1000); return null;
+            case "ping": return "{\"t\":\"pong\"}";
         }
-
         ControlService c = ControlService.instance;
         if (c == null) return "{\"t\":\"noacc\"}";
-        float w = realW, h = realH;
         switch (t) {
-            case "tap":
-                c.tap((float) o.optDouble("x") * w, (float) o.optDouble("y") * h, o.optLong("d", 40));
+            case "tap": {
+                float[] a = map(o.optDouble("x"), o.optDouble("y"));
+                c.tap(a[0], a[1], o.optLong("d", 40));
                 break;
-            case "swipe":
-                c.swipe((float) o.optDouble("x1") * w, (float) o.optDouble("y1") * h,
-                        (float) o.optDouble("x2") * w, (float) o.optDouble("y2") * h,
-                        o.optLong("d", 300));
+            }
+            case "swipe": {
+                float[] a = map(o.optDouble("x1"), o.optDouble("y1"));
+                float[] b = map(o.optDouble("x2"), o.optDouble("y2"));
+                c.swipe(a[0], a[1], b[0], b[1], o.optLong("d", 300));
                 break;
-            case "key":
-                c.globalKey(o.optString("k"));
-                break;
-            case "text":
-                if (!c.typeText(o.optString("v"))) return "{\"t\":\"nofield\"}";
-                break;
-            case "bksp":
-                if (!c.backspace()) return "{\"t\":\"nofield\"}";
-                break;
-            case "clear":
-                if (!c.clearText()) return "{\"t\":\"nofield\"}";
-                break;
-            case "enter":
-                c.enter();
-                break;
+            }
+            case "key": c.globalKey(o.optString("k")); break;
+            case "text": if (!c.typeText(o.optString("v"))) return "{\"t\":\"nofield\"}"; break;
+            case "bksp": if (!c.backspace()) return "{\"t\":\"nofield\"}"; break;
+            case "clear": if (!c.clearText()) return "{\"t\":\"nofield\"}"; break;
+            case "enter": c.enter(); break;
         }
         return null;
     }
@@ -312,26 +270,165 @@ public class ScreenService extends Service {
         PowerManager.WakeLock wl = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK
                 | PowerManager.ACQUIRE_CAUSES_WAKEUP, "pantallaremota:wake");
         wl.acquire(5000);
-        requestFrame();
     }
 
-    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+    private void setBitrate(int bps) {
+        maxBitrate = Math.max(150_000, Math.min(bps, 6_000_000));
+        for (Session s : sessions.values()) s.applyBitrate();
+    }
 
     @Override
     public void onDestroy() {
         instance = null;
-        if (server != null) { try { server.stop(); } catch (Exception ignored) { } server = null; }
-        if (encoder != null) encoder.shutdownNow();
-        if (virtualDisplay != null) { virtualDisplay.release(); virtualDisplay = null; }
-        if (reader != null) { reader.close(); reader = null; }
-        if (projection != null) {
-            MediaProjection p = projection;
-            projection = null;
-            try { p.stop(); } catch (Exception ignored) { }
-        }
-        if (thread != null) thread.quitSafely();
+        signalState = "Detenido";
+        if (signaling != null) signaling.stop();
+        for (Session s : sessions.values()) s.close();
+        exec.shutdown();
+        try { if (capturer != null) capturer.stopCapture(); } catch (Exception ignored) { }
+        if (capturer != null) capturer.dispose();
+        if (track != null) track.dispose();
+        if (source != null) source.dispose();
+        if (textureHelper != null) textureHelper.dispose();
+        if (factory != null) factory.dispose();
+        if (egl != null) egl.release();
+        factory = null;
         if (cpuLock != null && cpuLock.isHeld()) cpuLock.release();
-        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
         super.onDestroy();
+    }
+
+    // ------------------------------------------------------------ sesión
+
+    private static class SdpAdapter implements SdpObserver {
+        @Override public void onCreateSuccess(SessionDescription d) { }
+        @Override public void onSetSuccess() { }
+        @Override public void onCreateFailure(String e) { }
+        @Override public void onSetFailure(String e) { }
+    }
+
+    /** Una conexión con un navegador. */
+    private class Session implements PeerConnection.Observer, DataChannel.Observer {
+        final String peer, sid;
+        PeerConnection pc;
+        RtpSender sender;
+        DataChannel dc;
+        boolean remoteSet, closed;
+        final List<IceCandidate> pending = new ArrayList<>();
+
+        Session(String peer, String sid) { this.peer = peer; this.sid = sid; }
+
+        void start(String offerSdp) {
+            PeerConnection.RTCConfiguration cfg = new PeerConnection.RTCConfiguration(Config.iceServers());
+            cfg.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
+            pc = factory.createPeerConnection(cfg, this);
+            if (pc == null) { sessions.remove(sid); return; }
+            pc.setRemoteDescription(new SdpAdapter() {
+                @Override public void onSetSuccess() { exec.execute(Session.this::answer); }
+                @Override public void onSetFailure(String e) { exec.execute(Session.this::close); }
+            }, new SessionDescription(SessionDescription.Type.OFFER, offerSdp));
+        }
+
+        private void answer() {
+            if (closed) return;
+            remoteSet = true;
+            for (IceCandidate c : pending) pc.addIceCandidate(c);
+            pending.clear();
+            sender = pc.addTrack(track, Collections.singletonList("pantalla"));
+            applyBitrate();
+            pc.createAnswer(new SdpAdapter() {
+                @Override public void onCreateSuccess(SessionDescription d) {
+                    pc.setLocalDescription(new SdpAdapter() {
+                        @Override public void onSetSuccess() {
+                            try {
+                                signaling.send("ANSWER", peer, new JSONObject()
+                                        .put("sid", sid).put("sdp", d.description));
+                            } catch (Exception ignored) { }
+                        }
+                    }, d);
+                }
+                @Override public void onCreateFailure(String e) { exec.execute(Session.this::close); }
+            }, new MediaConstraints());
+        }
+
+        void applyBitrate() {
+            RtpSender s = sender;
+            if (s == null) return;
+            try {
+                RtpParameters params = s.getParameters();
+                for (RtpParameters.Encoding e : params.encodings) {
+                    e.maxBitrateBps = maxBitrate;
+                    e.maxFramerate = FPS;
+                }
+                s.setParameters(params);
+            } catch (Exception ignored) { }
+        }
+
+        void addRemoteCandidate(JSONObject p) {
+            IceCandidate c = new IceCandidate(p.optString("sdpMid"),
+                    p.optInt("sdpMLineIndex"), p.optString("candidate"));
+            if (remoteSet) pc.addIceCandidate(c); else pending.add(c);
+        }
+
+        void close() {
+            if (closed) return;
+            closed = true;
+            sessions.remove(sid);
+            try { if (dc != null) dc.close(); } catch (Exception ignored) { }
+            try { if (pc != null) pc.close(); } catch (Exception ignored) { }
+        }
+
+        void sendText(String s) {
+            DataChannel d = dc;
+            if (d == null || d.state() != DataChannel.State.OPEN) return;
+            d.send(new DataChannel.Buffer(ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8)), false));
+        }
+
+        // PeerConnection.Observer
+        @Override public void onIceCandidate(IceCandidate c) {
+            try {
+                signaling.send("CANDIDATE", peer, new JSONObject().put("sid", sid)
+                        .put("candidate", c.sdp).put("sdpMid", c.sdpMid)
+                        .put("sdpMLineIndex", c.sdpMLineIndex));
+            } catch (Exception ignored) { }
+        }
+        @Override public void onConnectionChange(PeerConnection.PeerConnectionState st) {
+            if (st == PeerConnection.PeerConnectionState.FAILED
+                    || st == PeerConnection.PeerConnectionState.CLOSED) {
+                exec.execute(this::close);
+            } else if (st == PeerConnection.PeerConnectionState.DISCONNECTED) {
+                main.postDelayed(() -> {
+                    if (pc != null && !closed && pc.connectionState()
+                            == PeerConnection.PeerConnectionState.DISCONNECTED) exec.execute(this::close);
+                }, 15000);
+            }
+        }
+        @Override public void onDataChannel(DataChannel channel) {
+            dc = channel;
+            channel.registerObserver(this);
+        }
+        @Override public void onSignalingChange(PeerConnection.SignalingState s) { }
+        @Override public void onIceConnectionChange(PeerConnection.IceConnectionState s) { }
+        @Override public void onIceConnectionReceivingChange(boolean b) { }
+        @Override public void onIceGatheringChange(PeerConnection.IceGatheringState s) { }
+        @Override public void onIceCandidatesRemoved(IceCandidate[] c) { }
+        @Override public void onAddStream(MediaStream s) { }
+        @Override public void onRemoveStream(MediaStream s) { }
+        @Override public void onRenegotiationNeeded() { }
+        @Override public void onAddTrack(RtpReceiver r, MediaStream[] s) { }
+
+        // DataChannel.Observer
+        @Override public void onBufferedAmountChange(long l) { }
+        @Override public void onStateChange() { }
+        @Override public void onMessage(DataChannel.Buffer buffer) {
+            ByteBuffer data = buffer.data;
+            byte[] b = new byte[data.remaining()];
+            data.get(b);
+            String txt = new String(b, StandardCharsets.UTF_8);
+            exec.execute(() -> {
+                try {
+                    String reply = handleCommand(new JSONObject(txt));
+                    if (reply != null) sendText(reply);
+                } catch (Throwable ignored) { }
+            });
+        }
     }
 }
